@@ -1634,3 +1634,192 @@ test_fail_sqlite_order_by_function_with_unqualified_reference:
   configs:
     core:
       dialect: sqlite
+
+test_fail_no_fix_postgres_where_subquery_outer_unnest_alias_qualified:
+  # `k` is the column of the outer `unnest(...) AS k` (PostgreSQL names the
+  # single column of a scalar table function after the alias), not a column
+  # of `widget`. Qualifying it as `w.k` would turn a working query into
+  # "column w.k does not exist", so report the inconsistency without a fix.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE w.id = k)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: qualified
+
+test_fail_no_fix_postgres_where_subquery_outer_unnest_alias_consistent:
+  # Same as above with the default "consistent" style: the inconsistent
+  # reference is still reported, but left alone.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE w.id = k)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_where_subquery_outer_generate_series_alias_qualified:
+  # generate_series() is the other value source that has no table alias.
+  fail_str: |
+    SELECT k FROM generate_series(1, 3) AS k
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE w.id = k)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: qualified
+
+test_fail_no_fix_postgres_where_subquery_outer_unnest_column_alias_consistent:
+  # The column is declared separately from the alias as `AS u (k)`, so it
+  # can't simply be matched against the alias name `u`.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS u (k)
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE w.id = k)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_where_subquery_outer_unnest_alias_shadows_inner_consistent:
+  # The inner table uses the same alias `ids`, but `id` may still be the
+  # outer unnest column rather than a column of `widget`. Without a schema
+  # it isn't safe to pick the inner table.
+  fail_str: |
+    SELECT id FROM unnest(ARRAY[1, 2]) AS ids (id)
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS ids WHERE ids.id = id)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_lateral_subquery_outer_unnest_alias_consistent:
+  # A LATERAL subquery can see the FROM clause of the outer query, and so can
+  # the nested subquery in its select list. `k` may be the unnest column.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k,
+    LATERAL (SELECT (SELECT 1 FROM widget AS w WHERE w.id = k) AS c) AS d
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_nested_where_subquery_outer_unnest_alias_consistent:
+  # Correlated references resolve through every enclosing query, not just the
+  # direct parent, so the outermost unnest column is still visible here.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k
+    WHERE EXISTS (
+        SELECT 1
+        FROM other_table AS o
+        WHERE EXISTS (SELECT 1 FROM widget AS w WHERE w.id = k)
+    )
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_select_list_subquery_outer_unnest_alias_consistent:
+  # A subquery in the select list can see the FROM clause of its parent too.
+  fail_str: |
+    SELECT
+        k,
+        (SELECT w.z FROM widget AS w WHERE w.id = k) AS v
+    FROM unnest(ARRAY[1, 2]) AS k
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_postgres_where_subquery_outer_unnest_alias_unqualified:
+  # Removing qualifiers is still safe: unqualified names resolve to the
+  # inner table first, so `id` still refers to `widget`.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE w.id = 1)
+  fix_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE id = 1)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: unqualified
+
+test_fail_postgres_derived_table_subquery_outer_unnest_alias_consistent:
+  # A plain derived table can't see the FROM clause of the query which holds
+  # it, so the unnest column isn't visible to the nested subquery and `x`
+  # belongs to `widget`. The safe fix still applies.
+  fail_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k,
+    (SELECT (SELECT 1 FROM widget AS w WHERE w.id = x) AS c) AS d
+  fix_str: |
+    SELECT k FROM unnest(ARRAY[1, 2]) AS k,
+    (SELECT (SELECT 1 FROM widget AS w WHERE w.id = w.x) AS c) AS d
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_postgres_where_subquery_outer_ordinary_table_consistent:
+  # Guard the existing behaviour: with an ordinary outer table the reference
+  # is reported but never fixed, however the outer table is named.
+  fail_str: |
+    SELECT o.k FROM outer_t AS o
+    WHERE NOT EXISTS (SELECT 1 FROM widget AS w WHERE w.id = k)
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_nested_tableless_subquery_outer_unnest_alias_consistent:
+  # The intermediate query has no table of its own, so if the unnest column
+  # weren't carried up the ancestor chain, RF03 would think the innermost
+  # subquery has a single table and qualify `k` with `w`.
+  fail_str: |
+    SELECT 1
+    FROM unnest(ARRAY[1, 2]) AS k
+    WHERE EXISTS (
+        SELECT (SELECT 1 FROM widget AS w WHERE w.id = k)
+    )
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: consistent
+
+test_fail_no_fix_postgres_nested_tableless_subquery_outer_unnest_alias_qualified:
+  # Same shape with the explicit "qualified" style.
+  fail_str: |
+    SELECT 1
+    FROM unnest(ARRAY[1, 2]) AS k
+    WHERE EXISTS (
+        SELECT (SELECT 1 FROM widget AS w WHERE w.id = k)
+    )
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: qualified
