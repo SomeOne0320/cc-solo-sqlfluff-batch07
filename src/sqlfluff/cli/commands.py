@@ -6,10 +6,11 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from itertools import chain
 from logging import LogRecord
-from typing import Any, Callable, Dict, List, Optional, Union, cast
+from typing import Any, Callable, Dict, List, Optional, TextIO, Union, cast
 
 # Third-party imports
 import click
@@ -43,6 +44,7 @@ from sqlfluff.core import (
 )
 from sqlfluff.core.config import progress_bar_configuration
 from sqlfluff.core.linter import LintingResult, ParsedString
+from sqlfluff.core.linter.linted_dir import LintingRecord
 from sqlfluff.core.linter.linted_file import TMP_PRS_ERROR_TYPES
 from sqlfluff.core.plugin.host import get_plugin_manager
 from sqlfluff.core.rules.noqa import IgnoreMask
@@ -669,6 +671,67 @@ def dump_file_payload(filename: Optional[str], payload: str) -> None:
         click.echo(payload)
 
 
+class JsonlResultsWriter:
+    """Write one JSON object per completed file, as soon as it is ready.
+
+    Each line is a complete, independently parseable JSON object using the
+    same fields as a single record from the ``json`` output format. Lines are
+    written and flushed individually and unbuffered so that consumers can read
+    results while a batch is still being linted. Writes are serialised so that
+    concurrent files can never share or interleave a line.
+
+    Args:
+        output_path: An optional file to write to. When set, results are
+            written only to this file, never to stdout.
+    """
+
+    def __init__(self, output_path: Optional[str] = None) -> None:
+        self._lock = threading.Lock()
+        self._output_path = output_path
+        self._closed = False
+        # Open the destination up front (if any), so that an empty result
+        # still leaves an empty results file rather than no file at all.
+        # Unbuffered, so each completed record is immediately visible to
+        # anything else reading the file.
+        self._file: Optional[TextIO] = (
+            open(output_path, "w", encoding="utf-8", buffering=1)
+            if output_path
+            else None
+        )
+
+    def write(self, record: LintingRecord) -> None:
+        """Write one completed file record as a single flushed JSON line."""
+        line = json.dumps(record, ensure_ascii=False)
+        with self._lock:
+            if self._closed:
+                raise ValueError("Cannot write to a closed JsonlResultsWriter.")
+            if self._file is not None:
+                self._file.write(line + "\n")
+                self._file.flush()
+                return
+            # Write UTF-8 bytes directly for stdout where possible, so that
+            # non-ASCII filenames and content survive regardless of the
+            # locale's text encoding. Fall back to a text stream if needed.
+            stdout_buffer = getattr(sys.stdout, "buffer", None)
+            if stdout_buffer is not None:
+                # Flush any pending text output before writing to the buffer
+                # underneath it, so line order is preserved.
+                sys.stdout.flush()
+                stdout_buffer.write((line + "\n").encode("utf-8"))
+                stdout_buffer.flush()
+            else:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+
+    def close(self) -> None:
+        """Close the underlying file, if any."""
+        with self._lock:
+            self._closed = True
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
+
 @cli.command()
 @common_options
 @core_options
@@ -770,10 +833,19 @@ def lint(
         machine_output=format != FormatType.human.value,
     )
     file_output = None
+    # For the streaming format, records are written as each file completes,
+    # rather than collected and serialised at the end.
+    jsonl_writer: Optional[JsonlResultsWriter] = None
+    record_callback: Optional[Callable[[LintingRecord], None]] = None
     output_stream = make_output_stream(config, format, write_output)
     lnt, formatter = get_linter_and_formatter(
         config, output_stream, output_policy=output_policy
     )
+    if format == FormatType.jsonl.value:
+        # Open the destination only once we're set up to lint, but before any
+        # file is processed, so every completed file can be written immediately.
+        jsonl_writer = JsonlResultsWriter(write_output)
+        record_callback = jsonl_writer.write
 
     progress_bar_configuration.disable_progress_bar = bool(
         disable_progress_bar
@@ -798,25 +870,35 @@ def lint(
         )
 
     with PathAndUserErrorHandler(formatter):
-        # add stdin if specified via lone '-'
-        if ("-",) == paths:
-            if stdin_filename:
-                lnt.config = lnt.config.make_child_from_path(
-                    stdin_filename, require_dialect=False
+        try:
+            # add stdin if specified via lone '-'
+            if ("-",) == paths:
+                if stdin_filename:
+                    lnt.config = lnt.config.make_child_from_path(
+                        stdin_filename, require_dialect=False
+                    )
+                result = lnt.lint_string_wrapped(
+                    sys.stdin.read(),
+                    fname="stdin",
+                    stdin_filename=stdin_filename,
+                    record_callback=record_callback,
                 )
-            result = lnt.lint_string_wrapped(
-                sys.stdin.read(), fname="stdin", stdin_filename=stdin_filename
-            )
-        else:
-            result = lnt.lint_paths(
-                paths,
-                ignore_non_existent_files=False,
-                ignore_files=not disregard_sqlfluffignores,
-                processes=processes,
-                # If we're just linting in the CLI, we don't need to retain the
-                # raw file content. This allows us to reduce memory overhead.
-                retain_files=False,
-            )
+            else:
+                result = lnt.lint_paths(
+                    paths,
+                    ignore_non_existent_files=False,
+                    ignore_files=not disregard_sqlfluffignores,
+                    processes=processes,
+                    # If we're just linting in the CLI, we don't need to retain the
+                    # raw file content. This allows us to reduce memory overhead.
+                    retain_files=False,
+                    record_callback=record_callback,
+                )
+        finally:
+            # Always close the streaming writer (idempotently), even if
+            # linting exits early with a user error.
+            if jsonl_writer:
+                jsonl_writer.close()
 
     # Output the final stats
     if not non_human_output:
@@ -828,6 +910,10 @@ def lint(
 
     if format == FormatType.json.value:
         file_output = json.dumps(result.as_records())
+    elif format == FormatType.jsonl.value:
+        # Records were already written as each file completed. There is
+        # deliberately no trailing summary record or array.
+        file_output = None
     elif format == FormatType.yaml.value:
         file_output = yaml.dump(
             result.as_records(),
@@ -1078,13 +1164,20 @@ def lint(
 
     output_stream.close()
     if bench:
-        click.echo("==== overall timings ====")
-        click.echo(formatter.cli_table([("Clock time", result.total_time)]))
+        # For the streaming format, keep stdout exclusively machine readable
+        # and send timing tables to stderr instead.
+        bench_stream = sys.stderr if format == FormatType.jsonl.value else None
+        click.echo("==== overall timings ====", file=bench_stream)
+        click.echo(
+            formatter.cli_table([("Clock time", result.total_time)]),
+            file=bench_stream,
+        )
         timing_summary = result.timing_summary()
         for step in timing_summary:
-            click.echo(f"=== {step} ===")
+            click.echo(f"=== {step} ===", file=bench_stream)
             click.echo(
-                formatter.cli_table(timing_summary[step].items(), cols=3, col_width=20)
+                formatter.cli_table(timing_summary[step].items(), cols=3, col_width=20),
+                file=bench_stream,
             )
 
     if not nofail:

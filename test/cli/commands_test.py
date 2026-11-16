@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from unittest.mock import MagicMock, patch
 
 # Testing libraries
@@ -21,6 +22,7 @@ from click.testing import CliRunner
 # We import the library directly here to get the version
 import sqlfluff
 from sqlfluff.cli.commands import (
+    JsonlResultsWriter,
     cli_format,
     dialects,
     fix,
@@ -2400,6 +2402,492 @@ def test__cli__command_lint_serialize_multiple_files(serialize, write_file, tmp_
         assert len(result) == 16
     else:
         raise Exception
+
+
+def _jsonl_records(payload: str) -> list[dict]:
+    """Parse a JSONL payload, checking each line is a whole JSON object."""
+    # `splitlines` also catches stray literal newlines inside a record, which
+    # would otherwise split one record across multiple lines.
+    return [json.loads(line) for line in payload.splitlines() if line]
+
+
+def test__cli__jsonl_writer_concurrent_writes_never_interleave(tmp_path):
+    """Concurrent writers each produce one whole line."""
+    import threading
+
+    target = tmp_path / "out.jsonl"
+    writer = JsonlResultsWriter(str(target))
+    records = [{"filepath": f"file_{idx}.sql"} for idx in range(100)]
+
+    def write_all(batch):
+        for record in batch:
+            writer.write(record)
+
+    threads = [
+        threading.Thread(target=write_all, args=(records[idx::4],)) for idx in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    writer.close()
+
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == len(records)
+    # Every line parses independently and no file is repeated.
+    parsed = [json.loads(line) for line in lines]
+    assert sorted(record["filepath"] for record in parsed) == sorted(
+        record["filepath"] for record in records
+    )
+
+
+def test__cli__jsonl_writer_falls_back_to_text_stream(monkeypatch):
+    """Without a binary buffer, the writer still emits one flushed line."""
+    import io
+
+    stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    writer = JsonlResultsWriter()
+    writer.write({"filepath": "a.sql"})
+    writer.close()
+    assert _jsonl_records(stdout.getvalue()) == [{"filepath": "a.sql"}]
+    assert "\n" in stdout.getvalue()
+
+
+def test__cli__jsonl_writer_closed_raises(tmp_path):
+    """Writing after close is a programming error."""
+    writer = JsonlResultsWriter(str(tmp_path / "out.jsonl"))
+    writer.close()
+    with pytest.raises(ValueError):
+        writer.write({"filepath": "a.sql"})
+
+
+@pytest.mark.parametrize("write_file", [None, "outfile"])
+def test__cli__command_lint_jsonl_matches_json_records(write_file, tmp_path):
+    """JSONL records use exactly the per-file fields of the JSON format.
+
+    Every completed file is represented once, clean or not, and no array or
+    summary record is added at the end.
+    """
+    fpath1 = "test/fixtures/linter/indentation_errors.sql"
+    fpath2 = "test/fixtures/linter/multiple_sql_errors.sql"
+
+    json_result = invoke_assert_code(
+        args=[
+            lint,
+            (fpath1, fpath2, "--format", "json", "--disable-progress-bar"),
+        ],
+        ret_code=1,
+    )
+    jsonl_args = [fpath1, fpath2, "--format", "jsonl", "--disable-progress-bar"]
+    target_file = None
+    if write_file:
+        target_file = os.path.join(tmp_path, "outfile.jsonl")
+        jsonl_args += ["--write-output", target_file]
+    jsonl_result = invoke_assert_code(args=[lint, jsonl_args], ret_code=1)
+
+    if target_file:
+        with open(target_file, "r", encoding="utf-8") as payload_file:
+            payload = payload_file.read()
+        # Machine results go only to the file, never duplicated to stdout.
+        assert jsonl_result.stdout == ""
+    else:
+        payload = jsonl_result.stdout
+
+    records = _jsonl_records(payload)
+    # One line per file, in completion order. Compare as a set of records.
+    assert len(records) == 2
+    assert {record["filepath"] for record in records} == {
+        fpath1.replace("/", os.sep) if os.sep != "/" else fpath1,
+        fpath2,
+    }
+    # Each completed file is written exactly once.
+    assert len({record["filepath"] for record in records}) == len(records)
+    expected = {
+        record["filepath"]: {**record, "timings": {}}
+        for record in json.loads(json_result.stdout)
+    }
+    for record in records:
+        assert set(record) == {"filepath", "violations", "statistics", "timings"}
+        assert {**record, "timings": {}} == expected[record["filepath"]]
+        assert "fixes" in json.dumps(record["violations"]) or record["violations"] == []
+
+
+def test__cli__command_lint_jsonl_streams_while_still_running(tmp_path):
+    """A finished file is readable before the next file has been processed.
+
+    The second file's templating blocks on a release flag which this test only
+    sets after it has read the first file's line. If results were only written
+    once the whole batch finished, nothing would be readable at that point and
+    the process would deadlock (and fail on the timeout below).
+    """
+    project = tmp_path / "project"
+    lib_dir = project / "libs"
+    lib_dir.mkdir(parents=True)
+    release_flag = project / "release.flag"
+    # A package (`__init__.py`) so that the filter is loaded from the module
+    # namespace rather than as a submodule attribute.
+    (lib_dir / "__init__.py").write_text(
+        textwrap.dedent(
+            """
+            import os
+            import time
+
+            def wait(value):
+                \"\"\"Block until the release flag exists.\"\"\"
+                deadline = time.monotonic() + 30
+                while not os.path.exists(os.environ["STREAM_RELEASE_FLAG"]):
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("release flag never appeared")
+                    time.sleep(0.05)
+                return value
+
+            SQLFLUFF_JINJA_FILTERS = {"wait": wait}
+            """
+        ),
+        encoding="utf-8",
+    )
+    (project / "fast.sql").write_text("SELECT 1\n", encoding="utf-8")
+    (project / "slow.sql").write_text("SELECT {{ 1 | wait }}\n", encoding="utf-8")
+    output_file = project / "out.jsonl"
+    env = dict(
+        os.environ,
+        STREAM_RELEASE_FLAG=str(release_flag),
+    )
+    with output_file.open("wb") as output_handle:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "sqlfluff",
+                "lint",
+                "fast.sql",
+                "slow.sql",
+                "--dialect",
+                "ansi",
+                "--templater",
+                "jinja",
+                "--library-path",
+                str(lib_dir),
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+            ],
+            cwd=str(project),
+            stdout=output_handle,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            first_line = None
+            while time.monotonic() < deadline:
+                if output_file.exists():
+                    content = output_file.read_text(encoding="utf-8")
+                    # Only treat it as readable once a whole line is present.
+                    if content.endswith("\n"):
+                        first_line = content
+                        break
+                time.sleep(0.05)
+            assert first_line is not None, (
+                "No complete result was readable while the second file was "
+                "still being processed. Results are not being streamed per file."
+            )
+            # Crucially, the batch has not finished: the second file is blocked.
+            assert process.poll() is None, (
+                "The run finished before the second file was released."
+            )
+            # The readable result is exactly one complete record for the fast file.
+            first_records = _jsonl_records(first_line)
+            assert len(first_records) == 1
+            assert first_records[0]["filepath"] == "fast.sql"
+            assert first_records[0]["violations"] == []
+
+            # Now let the second file complete, and check the full output.
+            release_flag.touch()
+            stderr = process.communicate(timeout=60)[1]
+        finally:
+            if process.poll() is None:  # pragma: no cover
+                process.kill()
+                process.communicate()
+            release_flag.touch(exist_ok=True)
+
+    assert stderr == b""
+    records = _jsonl_records(output_file.read_text(encoding="utf-8"))
+    assert [record["filepath"] for record in records] == ["fast.sql", "slow.sql"]
+    assert all(record["violations"] == [] for record in records)
+
+
+def test__cli__command_lint_jsonl_parallel_lines_stay_whole(tmp_path):
+    """Parallel runs never merge two files into one line."""
+    project = tmp_path / "project"
+    project.mkdir()
+    for idx in range(6):
+        (project / f"file_{idx}.sql").write_text(
+            "SElect a from b\n" if idx % 2 else "select a from b\n",
+            encoding="utf-8",
+        )
+
+    result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (
+                str(project),
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+                "--processes",
+                "2",
+                "--dialect",
+                "ansi",
+            ),
+        ],
+    )
+    # Every line is a complete object, and each file appears exactly once.
+    records = _jsonl_records(result.stdout)
+    assert len(records) == 6
+    filepaths = [record["filepath"] for record in records]
+    assert len(set(filepaths)) == 6
+    assert {record["filepath"] for record in records} == {
+        str(project / f"file_{idx}.sql") for idx in range(6)
+    }
+    for record in records:
+        # Even-numbered files are consistent lowercase (clean); odd-numbered
+        # files mix capitalisation and are unclean.
+        clean = record["filepath"].endswith(("file_0.sql", "file_2.sql", "file_4.sql"))
+        assert (record["violations"] == []) is clean
+    assert contains_ansi_escape(result.stdout) is False
+
+
+def test__cli__command_lint_jsonl_stdin():
+    """JSONL works from stdin, with the same per-file record shape."""
+    result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (
+                "-",
+                "--rules",
+                "CP01",
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+                "--dialect=ansi",
+            ),
+        ],
+        cli_input="SElect * from tbl",
+    )
+    records = _jsonl_records(result.stdout)
+    assert len(records) == 1
+    record = records[0]
+    assert record["filepath"] == "stdin"
+    assert [v["code"] for v in record["violations"]] == ["CP01", "CP01"]
+    assert record["violations"][0]["start_line_no"] == 1
+    assert record["violations"][0]["start_line_pos"] == 1
+    assert record["statistics"] == {
+        "source_chars": 17,
+        "templated_chars": 17,
+        "segments": 24,
+        "raw_segments": 12,
+    }
+
+
+def test__cli__command_lint_jsonl_directory(tmp_path, monkeypatch):
+    """JSONL works for a directory of files, including subdirectories."""
+    project = tmp_path / "project"
+    (project / "sub").mkdir(parents=True)
+    (project / "clean.sql").write_text("select a from b\n", encoding="utf-8")
+    (project / "unclean.sql").write_text("SElect a from b\n", encoding="utf-8")
+    (project / "sub" / "nested.sql").write_text("SElect a from b\n", encoding="utf-8")
+
+    monkeypatch.chdir(project)
+    result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (".", "--format", "jsonl", "--disable-progress-bar", "--dialect", "ansi"),
+        ],
+    )
+    records = _jsonl_records(result.stdout)
+    assert len(records) == 3
+    by_name = {os.path.basename(record["filepath"]): record for record in records}
+    assert set(by_name) == {"clean.sql", "unclean.sql", "nested.sql"}
+    assert by_name["clean.sql"]["violations"] == []
+    assert {v["code"] for v in by_name["unclean.sql"]["violations"]} == {"CP01"}
+    assert {v["code"] for v in by_name["nested.sql"]["violations"]} == {"CP01"}
+
+
+def test__cli__command_lint_jsonl_unicode_and_newlines(tmp_path):
+    """Unicode filenames and embedded newlines still round-trip as one line."""
+    project = tmp_path / "project"
+    project.mkdir()
+    # A Jinja templating failure embeds a real newline in its description.
+    (project / "中文 文件.sql").write_text(
+        "SELECT {{ 1 | no_such_filter }}\n", encoding="utf-8"
+    )
+
+    result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (
+                str(project / "中文 文件.sql"),
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+                "--dialect",
+                "ansi",
+                "--templater",
+                "jinja",
+            ),
+        ],
+    )
+    # A real newline inside the record must not split it across lines.
+    assert len(result.stdout.splitlines()) == 1
+    records = _jsonl_records(result.stdout)
+    assert len(records) == 1
+    record = records[0]
+    assert record["filepath"].endswith("中文 文件.sql")
+    templater_violations = [v for v in record["violations"] if v["code"] == "TMP"]
+    assert templater_violations
+    assert "\n" in templater_violations[0]["description"]
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "quiet"),
+    [(["-vvv"], False), (["--bench"], False), ([], True)],
+    ids=["verbose", "bench", "quiet"],
+)
+def test__cli__command_lint_jsonl_stdout_stays_machine_readable(
+    extra_args, quiet, tmp_path
+):
+    """Logging, progress, colour and diagnostics never join the JSON lines."""
+    fpath = "test/fixtures/linter/indentation_error_simple.sql"
+    args = [
+        fpath,
+        "--format",
+        "jsonl",
+        "--disable-progress-bar",
+        "--color",
+        *extra_args,
+    ]
+    if quiet:
+        args.append("--quiet")
+    result = invoke_assert_code(args=[lint, args], ret_code=1)
+
+    # Every stdout line must be a standalone JSON object.
+    records = _jsonl_records(result.stdout)
+    assert len(records) == 1
+    assert records[0]["filepath"].replace("\\", "/") == fpath
+    assert contains_ansi_escape(result.stdout) is False
+    assert "==== sqlfluff ====" not in result.stdout
+    assert "All Finished" not in result.stdout
+    # Diagnostics, including the bench tables, go to stderr instead.
+    if extra_args == ["--bench"]:
+        assert "==== overall timings ====" in result.stderr
+    if extra_args == ["-vvv"]:
+        assert result.stderr
+
+
+def test__cli__command_lint_jsonl_quiet_preserves_results():
+    """Quiet must not swallow the machine results."""
+    fpath = "test/fixtures/linter/indentation_error_simple.sql"
+    plain = invoke_assert_code(
+        args=[lint, (fpath, "--format", "jsonl", "--disable-progress-bar")],
+        ret_code=1,
+    )
+    quiet = invoke_assert_code(
+        args=[
+            lint,
+            (fpath, "--quiet", "--format", "jsonl", "--disable-progress-bar"),
+        ],
+        ret_code=1,
+    )
+    assert _strip_timings(quiet.stdout) == _strip_timings(plain.stdout)
+    assert quiet.stdout
+
+
+def _strip_timings(payload: str) -> list[dict]:
+    """Parse JSONL records, dropping the non-deterministic timings."""
+    return [{**record, "timings": {}} for record in _jsonl_records(payload)]
+
+
+def test__cli__command_lint_jsonl_ignores_warnings_and_exit_codes(tmp_path):
+    """Ignore markers, warnings and parse errors keep their usual meaning."""
+    # warnings_a.sql has a rule configured only as a warning.
+    warning_result = invoke_assert_code(
+        ret_code=0,
+        args=[
+            lint,
+            (
+                "test/fixtures/cli/warning_a.sql",
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+            ),
+        ],
+    )
+    warning_records = _jsonl_records(warning_result.stdout)
+    assert len(warning_records) == 1
+    warning_violations = warning_records[0]["violations"]
+    assert set(v["code"] for v in warning_violations) == {"LT01"}
+    assert all(v["warning"] is True for v in warning_violations)
+
+    # Inline noqa markers are still honoured.
+    ignore_result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (
+                "test/fixtures/linter/operator_errors_ignore.sql",
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+            ),
+        ],
+    )
+    ignore_records = _jsonl_records(ignore_result.stdout)
+    assert len(ignore_records) == 1
+    assert all(v["code"] != "LT03" for v in ignore_records[0]["violations"])
+
+    # Parse errors are recorded and still fail the run.
+    parse_result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (
+                "test/fixtures/linter/parse_error.sql",
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+            ),
+        ],
+    )
+    parse_records = _jsonl_records(parse_result.stdout)
+    assert len(parse_records) == 1
+    assert "PRS" in {v["code"] for v in parse_records[0]["violations"]}
+
+
+def test__cli__command_lint_jsonl_no_summary_record():
+    """JSONL is not an array and has no trailing summary record."""
+    result = invoke_assert_code(
+        ret_code=1,
+        args=[
+            lint,
+            (
+                "test/fixtures/linter/indentation_errors.sql",
+                "--format",
+                "jsonl",
+                "--disable-progress-bar",
+            ),
+        ],
+    )
+    assert not result.stdout.lstrip().startswith("[")
+    records = _jsonl_records(result.stdout)
+    assert len(records) == 1
+    # A record is a per-file record, not a summary of the run.
+    assert set(records[0]) == {"filepath", "violations", "statistics", "timings"}
 
 
 def test__cli__command_lint_serialize_github_annotation():

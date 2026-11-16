@@ -1419,3 +1419,67 @@ def test__linter__large_file_skip_fail_config(
     # But if large_file_skip_fail is set, the CLI would bump this to 1.
     would_fail = bool(result.files_skipped and config.get("large_file_skip_fail"))
     assert would_fail == expected_would_fail
+
+
+def test__linter__record_callback_receives_each_file_once():
+    """The record callback fires once per completed file, in completion order.
+
+    Records match `as_records()` and are emitted as files complete rather than
+    as a final batch, so a consumer can process each one immediately.
+    """
+    paths = (
+        "test/fixtures/linter/comma_errors.sql",
+        "test/fixtures/linter/passing.sql",
+    )
+    received = []
+    result = Linter(dialect="ansi").lint_paths(
+        paths, retain_files=False, record_callback=received.append
+    )
+    # One callback per file, exactly once each.
+    assert len(received) == 2
+    assert [record["filepath"] for record in received] == list(paths)
+    assert len({record["filepath"] for record in received}) == 2
+    # The callback receives the same records as the final result.
+    assert received == sorted(
+        result.as_records(), key=lambda record: paths.index(record["filepath"])
+    )
+
+
+def test__linter__record_callback_fires_before_next_file_finishes(monkeypatch):
+    """Each record is delivered before the next file has been linted."""
+    paths = (
+        "test/fixtures/linter/passing.sql",
+        "test/fixtures/linter/comma_errors.sql",
+    )
+    completed = []
+    linted_so_far = []
+    real_lint_rendered = Linter.lint_rendered
+
+    def tracking_lint_rendered(*args, **kwargs):
+        linted_file = real_lint_rendered(*args, **kwargs)
+        linted_so_far.append(linted_file.path)
+        return linted_file
+
+    monkeypatch.setattr(Linter, "lint_rendered", staticmethod(tracking_lint_rendered))
+
+    def record_callback(record):
+        # A record is delivered as soon as its own file completes, before the
+        # next file has been linted.
+        assert linted_so_far[-1] == record["filepath"]
+        completed.append((record["filepath"], tuple(linted_so_far)))
+
+    result = Linter(dialect="ansi").lint_paths(
+        paths, retain_files=False, record_callback=record_callback
+    )
+    assert [filepath for filepath, _ in completed] == list(paths)
+    # The first record arrived while only the first file had been linted.
+    assert completed[0] == (paths[0], (paths[0],))
+    assert len(result.as_records()) == 2
+
+
+def test__linter__record_callback_not_called_when_not_requested():
+    """Without a callback, linting behaves exactly as before."""
+    result = Linter(dialect="ansi").lint_paths(
+        ("test/fixtures/linter/passing.sql",), retain_files=False
+    )
+    assert len(result.as_records()) == 1

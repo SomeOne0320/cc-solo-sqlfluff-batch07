@@ -22,6 +22,7 @@ class FormatType(Enum):
 
     human = "human"
     json = "json"
+    jsonl = "jsonl"
     yaml = "yaml"
     sarif = "sarif"
     github_annotation = "github-annotation"

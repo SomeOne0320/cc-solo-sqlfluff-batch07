@@ -4,7 +4,7 @@ import fnmatch
 import logging
 import os
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Optional, Union, cast
 
 import regex
@@ -30,7 +30,7 @@ from sqlfluff.core.linter.common import (
 )
 from sqlfluff.core.linter.discovery import paths_from_path
 from sqlfluff.core.linter.fix import apply_fixes, compute_anchor_edit_info
-from sqlfluff.core.linter.linted_dir import LintedDir
+from sqlfluff.core.linter.linted_dir import LintedDir, LintingRecord
 from sqlfluff.core.linter.linted_file import (
     TMP_PRS_ERROR_TYPES,
     FileTimings,
@@ -1107,10 +1107,21 @@ class Linter:
         fname: str = "<string input>",
         fix: bool = False,
         stdin_filename: Optional[str] = None,
+        record_callback: Optional[Callable[[LintingRecord], None]] = None,
     ) -> LintingResult:
-        """Lint strings directly."""
+        """Lint strings directly.
+
+        Args:
+            string: The SQL to lint.
+            fname: The filename to associate with the string.
+            fix: Whether to apply fixes.
+            stdin_filename: An optional filename used to load config for stdin.
+            record_callback: An optional callback, called once for each file as
+                soon as its result record is complete. This allows callers to
+                consume results while other files are still being processed.
+        """
         result = LintingResult()
-        linted_path = LintedDir(fname)
+        linted_path = LintedDir(fname, record_callback=record_callback)
         if stdin_filename:
             # This opens up additional files like `Untitled` in vscode where linting
             # may be desired.
@@ -1151,8 +1162,16 @@ class Linter:
         fixed_file_suffix: str = "",
         fix_even_unparsable: bool = False,
         retain_files: bool = True,
+        record_callback: Optional[Callable[[LintingRecord], None]] = None,
     ) -> LintingResult:
-        """Lint an iterable of paths."""
+        """Lint an iterable of paths.
+
+        If `record_callback` is provided, it is called once for each file as
+        soon as that file's result record is complete. This allows callers to
+        consume results while other files are still being processed. Records
+        arrive in completion order, which in parallel runs may differ from the
+        order of `paths`.
+        """
         # If no paths specified - assume local
         if not paths:  # pragma: no cover
             paths = (os.getcwd(),)
@@ -1164,7 +1183,9 @@ class Linter:
         sql_exts = self.config.get("sql_file_exts", default=".sql").lower().split(",")
 
         for path in paths:
-            linted_dir = LintedDir(path, retain_files=retain_files)
+            linted_dir = LintedDir(
+                path, retain_files=retain_files, record_callback=record_callback
+            )
             result.add(linted_dir)
             for fname in paths_from_path(
                 path,

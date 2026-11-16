@@ -4,7 +4,7 @@ This stores the idea of a collection of linted files at a single start path
 
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Optional, TypedDict, Union
 
 from sqlfluff.core.errors import (
@@ -41,12 +41,21 @@ class LintedDir:
     and save memory overhead if not required.
     """
 
-    def __init__(self, path: str, retain_files: bool = True) -> None:
+    def __init__(
+        self,
+        path: str,
+        retain_files: bool = True,
+        record_callback: Optional[Callable[[LintingRecord], None]] = None,
+    ) -> None:
         self.files: list[LintedFile] = []
         self.path: str = path
         self.retain_files: bool = retain_files
         # Records
         self._records: list[LintingRecord] = []
+        # Optional callback, called once for each completed file as soon as
+        # its record is available. This allows callers to consume results
+        # while the rest of a batch is still being linted.
+        self._record_callback = record_callback
         # Stats
         self._num_files: int = 0
         self._num_clean: int = 0
@@ -140,6 +149,12 @@ class LintedDir:
         # Finally, if set to persist files, do that.
         if self.retain_files:
             self.files.append(file)
+
+        # Notify any streaming consumer that this file is complete. This is
+        # deliberately the last step, so the emitted record matches what
+        # `as_records()` would return and is only emitted once.
+        if self._record_callback:
+            self._record_callback(record)
 
     def check_tuples(
         self, raise_on_non_linting_violations: bool = True

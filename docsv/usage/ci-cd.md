@@ -24,6 +24,35 @@ for updates on this limitation.
 For more information and examples on using SQLFluff in GitHub Actions, see the
 [sqlfluff-github-actions repository](https://github.com/sqlfluff/sqlfluff-github-actions).
 
+## Streaming results with JSON Lines
+
+For large batches, the regular serialised formats are only written once every
+file has been linted. If you want to start processing results before a run
+finishes, use `--format jsonl`. Each file is written as a single, complete JSON
+object as soon as that file is linted, with a newline after it. Clean and
+unclean files both get a line, each file appears exactly once, and there is no
+surrounding array or trailing summary record.
+
+Each line uses the same per-file fields as one entry of the `--format json`
+output (`filepath`, `violations`, `statistics` and `timings`). In parallel runs,
+lines arrive in completion order, which may differ from the order of the input
+paths.
+
+```bash
+# Process each result as it becomes available.
+sqlfluff lint my_project --format jsonl | while IFS= read -r line; do
+    process_result "$line"
+done
+
+# Or write to a file which can be tailed while the lint is still running.
+sqlfluff lint my_project --format jsonl --write-output lint-results.jsonl
+```
+
+When `--write-output` is set, results go only to that file and not to stdout.
+Logging, progress bars, colours and diagnostics are kept off the JSON lines.
+For `--bench`, the timing tables are written to stderr instead of stdout so the
+output remains machine readable.
+
 ## Using GitLab CI Code Quality reports
 
 When `sqlfluff lint` is run with the `--format gitlab` option, it produces a
