@@ -321,3 +321,237 @@ def test__linted_file__fix_string_generates_patches_when_not_precomputed():
 
     assert changed
     assert fixed_sql == "SELECT\n    1\n"
+
+
+def test__linted_file__slice_source_file_using_patches_does_not_mutate_inputs():
+    """The slicing step must leave both input lists usable for repeated calls.
+
+    The previous implementation consumed ``source_only_slices`` with ``pop(0)``
+    so calling ``fix_string()`` twice no longer saw any template fragments.
+    """
+    source_only_slices = [
+        RawFileSlice("{# a #}", "comment", 0),
+        RawFileSlice("{# b #}", "comment", 7),
+    ]
+    source_patches = [
+        FixPatch(slice(7, 8), "x", "", slice(7, 8), "c", "c"),
+    ]
+    raw_source_string = "{# a #}{# b #}c"
+    expected_slices = LintedFile._slice_source_file_using_patches(
+        source_patches, source_only_slices, raw_source_string
+    )
+
+    # The inputs are untouched...
+    assert [slc.source_idx for slc in source_only_slices] == [0, 7]
+    # ...and a second call yields exactly the same result.
+    second_slices = LintedFile._slice_source_file_using_patches(
+        source_patches, source_only_slices, raw_source_string
+    )
+    assert second_slices == expected_slices
+
+
+def _make_scaled_linted_file(n):
+    """Build a templated LintedFile with O(n) patches and source-only slices.
+
+    Each iteration adds a Jinja comment (a source-only template fragment) plus
+    fixable statements, so template fragments, fix points and source length
+    all grow together with ``n``.
+    """
+    sql = (
+        "\n".join("{# comment %d #}\nselect  b_%d ;" % (i, i) for i in range(n)) + "\n"
+    )
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "templater": "jinja",
+            "rules": "CV06,LT01",
+        }
+    )
+    return Linter(config=config).lint_string(sql, fix=True)
+
+
+def test__linted_file__fix_string_is_repeatable_with_template_fragments():
+    """Repeated fix_string() calls return identical results without exhaustion.
+
+    Regression test for the writeback phase: neither the prepared source
+    patches nor the source-only template slices may be consumed while building
+    the corrected text, so calling ``fix_string()`` repeatedly on the same
+    lint result must always give the same string and the same changed flag.
+    """
+    linted = _make_scaled_linted_file(20)
+    assert linted.source_patches
+    n_patches = len(linted.source_patches)
+    n_source_only = len(linted.templated_file.source_only_slices())
+    assert n_source_only == 20
+
+    first_output = linted.fix_string()
+    for _ in range(3):
+        assert linted.fix_string() == first_output
+
+    fixed_sql, changed = first_output
+    assert changed
+    # Every template comment is retained...
+    for i in range(20):
+        assert "{# comment %d #}" % i in fixed_sql
+    # ...and every fix was applied, with newlines and unedited text preserved.
+    for i in range(20):
+        assert "select b_%d;" % i in fixed_sql
+    # The prepared fix list was not used up.
+    assert len(linted.source_patches) == n_patches
+    assert len(linted.templated_file.source_only_slices()) == n_source_only
+
+
+def test__linted_file__fix_string_writeback_edge_cases():
+    """The writeback phase handles all boundary-shaped edits correctly."""
+
+    def lint(sql, rules=None, templater="raw"):
+        overrides = {"dialect": "ansi", "templater": templater}
+        if rules:
+            overrides["rules"] = rules
+        return Linter(config=FluffConfig(overrides=overrides)).lint_string(
+            sql, fix=True
+        )
+
+    # Empty file without a triggering rule stays empty.
+    empty, empty_changed = lint("", rules="CV06").fix_string()
+    assert (empty, empty_changed) == ("", False)
+
+    # Non-English characters must not shift any edit positions.
+    sql = "select  1 as 名称, '日本語' from 表 where x  =  1\n"
+    fixed, changed = lint(sql).fix_string()
+    assert changed
+    assert "名称" in fixed and "日本語" in fixed and "表" in fixed
+    # A second application is idempotent and identical to the first.
+    assert lint(sql).fix_string() == (fixed, changed)
+
+    # Adjacent fixes combining an insertion and a deletion on a boundary.
+    fixed, changed = lint("select a  ,  b ;\n", rules="CV06,LT01").fix_string()
+    assert (fixed, changed) == ("select a, b;\n", True)
+
+    # A pure insertion at the start of the file (leading blank lines removed).
+    fixed, changed = lint("\n\nselect 1\n", rules="LT13").fix_string()
+    assert (fixed, changed) == ("select 1\n", True)
+
+    # A file with no fixes keeps every character, including template comments.
+    unchanged = "{# keep #}\nSELECT 1;\n"
+    fixed, changed = lint(unchanged, templater="jinja").fix_string()
+    assert (fixed, changed) == (unchanged, False)
+
+
+def test__linted_file__fix_string_keeps_explicit_template_edits():
+    """Fixes which edit the template itself must not be dropped during writeback."""
+    sql = "{%if true%}SELECT 1;\n{%endif%}\n"
+    config = FluffConfig(
+        overrides={
+            "dialect": "ansi",
+            "templater": "jinja",
+            "rules": "JJ01",
+        }
+    )
+    linted = Linter(config=config).lint_string(sql, fix=True)
+    # The Jinja edits are carried as explicit source patches.
+    assert linted.source_patches
+    assert all(patch.patch_category == "source" for patch in linted.source_patches)
+
+    fixed, changed = linted.fix_string()
+    assert changed
+    assert fixed == "{% if true %}SELECT 1;\n{% endif %}\n"
+    # Repeated application gives the same result and does not consume patches.
+    assert linted.fix_string() == (fixed, changed)
+
+
+def test__linted_file__writeback_scales_linearly():
+    """Doubling fragments and fixes must roughly double writeback work.
+
+    This guards against a regression back to the quadratic behaviour caused by
+    ``list.pop(0)`` slicing and the nested patch scan/string concatenation.
+    The check counts the actual slice-equality comparisons performed while
+    building the fixed string rather than measuring wall-clock time, so it is
+    not flaky under varying machine load.
+    """
+    small = _make_scaled_linted_file(25)
+    large = _make_scaled_linted_file(50)
+
+    def writeback_with_comparison_count(linted):
+        patches = linted.source_patches
+        source_only = linted.templated_file.source_only_slices()
+        source_str = linted.templated_file.source_str
+        slices = LintedFile._slice_source_file_using_patches(
+            patches, source_only, source_str
+        )
+
+        # Wrap each patch so we can observe how often its source slice is
+        # compared against a slice. A nested scan compares every patch with
+        # every slice; a linear merge visits each patch a constant number of
+        # times.
+        class CountingPatch:
+            def __init__(self, patch):
+                self._patch = patch
+
+            @property
+            def source_slice(self):
+                class CountingSlice:
+                    def __init__(self, real_slice, counter_ref):
+                        self._real = real_slice
+                        self._counter = counter_ref
+
+                    def _count(self):
+                        self._counter[0] += 1
+
+                    def __eq__(self, other):
+                        self._count()
+                        return self._real == other
+
+                    def __lt__(self, other):
+                        self._count()
+                        return self._real < other
+
+                    @property
+                    def start(self):
+                        return self._real.start
+
+                    @property
+                    def stop(self):
+                        return self._real.stop
+
+                return CountingSlice(self._patch.source_slice, counter_ref)
+
+            def __getattr__(self, name):
+                return getattr(self._patch, name)
+
+        counter_ref = [0]
+        counted_patches = [CountingPatch(patch) for patch in patches]
+        result = LintedFile._build_up_fixed_source_string(
+            slices, counted_patches, source_str
+        )
+        return result, slices, patches, source_only, counter_ref[0]
+
+    (
+        small_result,
+        small_slices,
+        small_patches,
+        small_source_only,
+        small_comparisons,
+    ) = writeback_with_comparison_count(small)
+    (
+        large_result,
+        large_slices,
+        large_patches,
+        large_source_only,
+        large_comparisons,
+    ) = writeback_with_comparison_count(large)
+
+    # Inputs doubled in every dimension...
+    assert len(large_patches) == 2 * len(small_patches)
+    assert len(large_source_only) == 2 * len(small_source_only)
+    # ...and so did the amount of slicing/output work, rather than quadrupling.
+    assert len(large_slices) == 2 * len(small_slices)
+    # The outputs themselves are correct and internally consistent.
+    assert small_result == small.fix_string()[0]
+    assert large_result == large.fix_string()[0]
+    # A nested scan would have quadrupled the comparison count when the
+    # inputs doubled; the linear merge stays within a small factor of two
+    # (boundary effects mean it need not be exactly 2x).
+    assert small_comparisons <= 2 * len(small_slices)
+    assert large_comparisons <= 2 * len(large_slices)
+    assert large_comparisons <= 3 * small_comparisons

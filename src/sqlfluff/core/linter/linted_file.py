@@ -266,7 +266,6 @@ class LintedFile(NamedTuple):
         fixed_source_string = self._build_up_fixed_source_string(
             slice_buff, filtered_source_patches, self.templated_file.source_str
         )
-
         # The success metric here is whether anything ACTUALLY changed.
         return fixed_source_string, fixed_source_string != original_source
 
@@ -289,8 +288,16 @@ class LintedFile(NamedTuple):
         """
         # We now slice up the file using the patches and any source only slices.
         # This gives us regions to apply changes to.
-        slice_buff = []
+        # Both lists are already sorted, so they can be merged with advancing
+        # pointers in a single linear pass. Indexes are used instead of mutating
+        # either input list (the previous ``pop(0)`` calls were themselves
+        # linear on every iteration), so this routine stays cheap and leaves
+        # its inputs untouched when called repeatedly.
+        slice_buff: list[slice] = []
         source_idx = 0
+        source_only_idx = 0
+        n_source_only = len(source_only_slices)
+
         for patch in source_patches:
             # Are there templated slices at or before the start of this patch?
             # TODO: We'll need to explicit handling for template fixes here, because
@@ -298,10 +305,12 @@ class LintedFile(NamedTuple):
             # here then this is the last hurdle and it will flow through
             # smoothly from here.
             while (
-                source_only_slices
-                and source_only_slices[0].source_idx < patch.source_slice.start
+                source_only_idx < n_source_only
+                and source_only_slices[source_only_idx].source_idx
+                < patch.source_slice.start
             ):
-                next_so_slice = source_only_slices.pop(0).source_slice()
+                next_so_slice = source_only_slices[source_only_idx].source_slice()
+                source_only_idx += 1
                 # Add a pre-slice before the next templated slices if needed.
                 if next_so_slice.start > source_idx:
                     slice_buff.append(slice(source_idx, next_so_slice.start))
@@ -311,17 +320,18 @@ class LintedFile(NamedTuple):
 
             # Does this patch cover the next source-only slice directly?
             if (
-                source_only_slices
-                and patch.source_slice == source_only_slices[0].source_slice()
+                source_only_idx < n_source_only
+                and patch.source_slice
+                == source_only_slices[source_only_idx].source_slice()
             ):
                 linter_logger.info(
                     "Removing next source only slice from the stack because it "
                     "covers the same area of source file as the current patch: %s %s",
-                    source_only_slices[0],
+                    source_only_slices[source_only_idx],
                     patch,
                 )
-                # If it does, remove it so that we don't duplicate it.
-                source_only_slices.pop(0)
+                # If it does, skip it so that we don't duplicate it.
+                source_only_idx += 1
 
             # Is there a gap between current position and this patch?
             if patch.source_slice.start > source_idx:
@@ -364,22 +374,41 @@ class LintedFile(NamedTuple):
         slice of exactly the right file in the list of file
         slices.
         """
-        # Iterate through the patches, building up the new string.
-        str_buff = ""
+        # Both lists are already sorted by position. Walk them together with
+        # an advancing patch pointer so that each slice is examined once and
+        # each patch is visited at most once, instead of scanning every patch
+        # for every slice. Collect the pieces and join them once: repeated
+        # ``str +=`` concatenation would copy the accumulated output on every
+        # iteration, which is itself quadratic in the number of edits.
+        str_buff: list[str] = []
+        patch_idx = 0
+        n_patches = len(source_patches)
         for source_slice in source_file_slices:
-            # Is it one in the patch buffer:
-            for patch in source_patches:
-                if patch.source_slice == source_slice:
-                    # Use the patched version
-                    linter_logger.debug(
-                        "%-30s    %s    %r > %r",
-                        f"Appending {patch.patch_category} Patch:",
-                        patch.source_slice,
-                        patch.source_str,
-                        patch.fixed_raw,
-                    )
-                    str_buff += patch.fixed_raw
-                    break
+            # Drop any patches which belong to an earlier slice (e.g. an
+            # overlapping patch that was skipped while slicing). Zero-length
+            # slices may share an endpoint with the following slice, so only
+            # advance while the patch is strictly before this slice.
+            while (
+                patch_idx < n_patches
+                and source_patches[patch_idx].source_slice.stop < source_slice.start
+            ):
+                patch_idx += 1
+            # Is this one in the patch buffer:
+            if (
+                patch_idx < n_patches
+                and source_patches[patch_idx].source_slice == source_slice
+            ):
+                patch = source_patches[patch_idx]
+                # Use the patched version
+                linter_logger.debug(
+                    "%-30s    %s    %r > %r",
+                    f"Appending {patch.patch_category} Patch:",
+                    patch.source_slice,
+                    patch.source_str,
+                    patch.fixed_raw,
+                )
+                str_buff.append(patch.fixed_raw)
+                patch_idx += 1
             else:
                 # Use the raw string
                 linter_logger.debug(
@@ -387,8 +416,8 @@ class LintedFile(NamedTuple):
                     source_slice,
                     raw_source_string[source_slice],
                 )
-                str_buff += raw_source_string[source_slice]
-        return str_buff
+                str_buff.append(raw_source_string[source_slice])
+        return "".join(str_buff)
 
     def persist_tree(
         self, suffix: str = "", formatter: Optional[FormatterInterface] = None
